@@ -285,6 +285,7 @@ Guidelines:
         max_retries = 5
         base_delay = 15
         media_ids = []
+        main_tweet_id = None
 
         for attempt in range(max_retries):
             try:
@@ -301,13 +302,23 @@ Guidelines:
                         'media_upload'
                     )
 
-                # 2. Tweet oluşturma
+                # 2. Create main tweet
                 self._check_tweet_limits()
                 tweet = self.twitter_client.create_tweet(
                     text=content,
                     media_ids=media_ids or None
                 )
-                self._log_success(repo, content, screenshot_path)
+                main_tweet_id = tweet.data['id']
+
+                # 3. Add repository link as reply
+                if main_tweet_id:
+                    reply_text = f"🔗 {repo['html_url']}"
+                    self.twitter_client.create_tweet(
+                        text=reply_text,
+                        in_reply_to_tweet_id=main_tweet_id
+                    )
+
+                self._log_success(repo, content, screenshot_path, main_tweet_id)
                 return True
 
             except tweepy.TooManyRequests as e:
@@ -345,10 +356,11 @@ Guidelines:
             print(f"Tweet creation limit reached. Waiting {wait_time} seconds")
             time.sleep(wait_time)
 
-    def _log_success(self, repo: Dict, content: str, screenshot_path: Optional[str]):
+    def _log_success(self, repo: Dict, content: str, screenshot_path: Optional[str], tweet_id: str):
         """Güncellenmiş log mekanizması"""
         log_entry = (
-            f"\n[{datetime.now().ctime()}] Posted: {repo['html_url']}\n"
+            f"\n[{datetime.now().ctime()}] Main Tweet ID: {tweet_id}\n"
+            f"Posted: {repo['html_url']}\n"
             f"Content: {content}\n"
             f"Media: {screenshot_path or 'None'}\n"
             f"Rate Limits: {self.rate_limit_tracker.limits}\n"
