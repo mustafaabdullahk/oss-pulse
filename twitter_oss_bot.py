@@ -4,6 +4,7 @@ import random
 import requests
 import tweepy
 import ollama
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from typing import List, Dict, Optional
 from dataclasses import dataclass
@@ -23,54 +24,73 @@ class Config:
     ollama_model: str = "deepseek-coder"
     screenshot_dir: str = "screenshots"
 
+class RateLimitTracker:
+    """Real-time rate limit tracking using Twitter API headers"""
+    def __init__(self):
+        self.limits = {
+            'tweet_create': {'limit': 50, 'remaining': 50, 'reset': 0},
+            'media_upload': {'limit': 50, 'remaining': 50, 'reset': 0}
+        }
+
+    def update_from_headers(self, headers: dict, endpoint: str):
+        """Update limits from API response headers"""
+        if not headers:
+            return
+
+        limit = int(headers.get('x-rate-limit-limit', self.limits[endpoint]['limit']))
+        remaining = int(headers.get('x-rate-limit-remaining', self.limits[endpoint]['remaining']))
+        reset = int(headers.get('x-rate-limit-reset', self.limits[endpoint]['reset']))
+
+        self.limits[endpoint] = {
+            'limit': limit,
+            'remaining': remaining,
+            'reset': reset
+        }
+
+    def get_wait_time(self, endpoint: str) -> int:
+        """Calculate remaining time until reset"""
+        reset_time = self.limits[endpoint]['reset']
+        return max(reset_time - int(time.time()) + 2, 0)
+
 class RepoTweetBot:
     def __init__(self, config: Config):
         self.config = config
         self.sleep_interval = 3600 / config.posts_per_hour
         self.log_file = "generated_tweets.log"
         self.posted_urls = self._load_posted_urls()
+        self.rate_limit_tracker = RateLimitTracker()
         self._setup_directories()
-        self.twitter_client_v2 = self._init_twitter_v2()
-        self.twitter_client_v1 = self._init_twitter_v1()
+        self.twitter_client = self._init_twitter()
+        self.media_client = self._init_media_api()
 
     def _setup_directories(self):
         """Create required directories with error handling"""
         try:
             screenshot_dir = Path(self.config.screenshot_dir)
             screenshot_dir.mkdir(parents=True, exist_ok=True)
-            print(f"Created screenshot directory at: {screenshot_dir.absolute()}")
         except Exception as e:
-            print(f"Error creating directories: {e}")
-            raise
+            raise RuntimeError(f"Directory creation failed: {e}")
 
-    def _init_twitter_v2(self) -> tweepy.Client:
-        """Initialize Twitter API v2 client"""
+    def _init_twitter(self) -> tweepy.Client:
+        """Initialize Twitter API v2 client with OAuth1.1"""
         return tweepy.Client(
-            bearer_token=self.config.twitter_bearer_token,
             consumer_key=self.config.twitter_api_key,
             consumer_secret=self.config.twitter_api_secret,
             access_token=self.config.twitter_access_token,
-            access_token_secret=self.config.twitter_access_token_secret
+            access_token_secret=self.config.twitter_access_token_secret,
+            wait_on_rate_limit=True
         )
 
-    def _init_twitter_v1(self) -> tweepy.API:
-        """Initialize Twitter API v1.1 with proper permissions"""
+    def _init_media_api(self) -> tweepy.API:
+        """Initialize v1.1 API for media uploads"""
         auth = tweepy.OAuth1UserHandler(
             consumer_key=self.config.twitter_api_key,
             consumer_secret=self.config.twitter_api_secret,
             access_token=self.config.twitter_access_token,
             access_token_secret=self.config.twitter_access_token_secret
         )
-        return tweepy.API(auth, wait_on_rate_limit=True)
-
-    def _load_posted_urls(self) -> set:
-        """Load previously posted URLs from log file"""
-        try:
-            with open(self.log_file, "r", encoding="utf-8") as f:
-                return set(line.split("URL: ")[1].strip() for line in f if "URL: " in line)
-        except FileNotFoundError:
-            return set()
-
+        return tweepy.API(auth)
+    
     def fetch_github_projects(self) -> List[Dict]:
         """Scrape trending repositories from GitHub's trending page"""
         try:
@@ -123,9 +143,13 @@ class RepoTweetBot:
                 finally:
                     browser.close()
                     
-        except Exception as e:
-            print(f"Error scraping trending page: {e}")
-            return []
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 403:  # GitHub rate limit
+                reset_time = int(e.response.headers.get('X-RateLimit-Reset', 3600))
+                print(f"GitHub rate limit exceeded. Resets at {time.ctime(reset_time)}")
+                time.sleep(reset_time - time.time() + 60)  # Add buffer
+                return []
+            raise
 
     def generate_tweet_content(self, repo: Dict) -> str:
         """Generate tweet content using Ollama deepseek-coder"""
@@ -160,6 +184,75 @@ Guidelines:
         except Exception as e:
             print(f"LLM generation failed: {e}")
             return self._generate_fallback_content(repo)
+        
+    def take_screenshot(self, url: str) -> Optional[str]:
+        """Capture square README section screenshot with validation"""
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page(viewport={'width': 1280, 'height': 2000})
+                
+                try:
+                    page.goto(url, timeout=60000)
+                    
+                    # Wait for README content with retries
+                    readme_element = None
+                    for _ in range(3):
+                        try:
+                            page.wait_for_selector("#readme, .markdown-body", state="visible", timeout=10000)
+                            readme_element = page.locator("#readme, .markdown-body")
+                            if readme_element.count() > 0:
+                                break
+                        except Exception as e:
+                            print(f"Retrying README detection: {e}")
+                            page.reload()
+                    else:
+                        raise Exception("Failed to find README section after 3 attempts")
+
+                    # Scroll and measure
+                    readme_element.scroll_into_view_if_needed()
+                    page.wait_for_timeout(2000)  # Allow full render
+                    
+                    # Get validated bounding box
+                    bbox = readme_element.bounding_box()
+                    if not bbox or bbox['width'] == 0 or bbox['height'] == 0:
+                        return None
+
+                    # Ensure capture area stays within page bounds
+                    square_size = 900
+                    page_width = page.evaluate("document.documentElement.scrollWidth")
+                    page_height = page.evaluate("document.documentElement.scrollHeight")
+                    
+                    safe_area = {
+                        "x": max(0, min(bbox["x"], page_width - square_size)),
+                        "y": max(0, min(bbox["y"], page_height - square_size)),
+                        "width": min(square_size, page_width),
+                        "height": min(square_size, page_height)
+                    }
+
+                    # Take screenshot
+                    filename = f"{url.split('/')[-1]}_{int(time.time())}.png"
+                    screenshot_path = Path(self.config.screenshot_dir) / filename
+                    
+                    page.screenshot(
+                        path=str(screenshot_path),
+                        clip=safe_area,
+                        type="png",
+                        animations="disabled",
+                        timeout=30000
+                    )
+                    return str(screenshot_path)
+                    
+                except Exception as e:
+                    print(f"Screenshot error: {e}")
+                    return None
+                finally:
+                    browser.close()
+                    
+        except Exception as e:
+            print(f"Screenshot failed for {url}: {e}")
+            return None
+
 
     def _sanitize_tweet(self, text: str) -> str:
         """Clean up generated tweet text"""
@@ -173,191 +266,136 @@ Guidelines:
         lang = repo.get('language', '')
         return f"🚀 Check out {name} - {desc[:100]}\n\n⭐ {stars} stars | {lang}\n#OpenSource #GitHub"
 
-    def take_screenshot(self, url: str) -> Optional[str]:
-        """Capture repository README section screenshot"""
+    def _load_posted_urls(self) -> set:
+        """Load previously posted URLs from log file"""
+        posted_urls = set()
         try:
-            screenshot_dir = Path(self.config.screenshot_dir)
-            if not screenshot_dir.exists():
-                raise FileNotFoundError(f"Screenshot directory {screenshot_dir} does not exist")
-
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                page = browser.new_page(viewport={'width': 1280, 'height': 2000})
-                
-                try:
-                    page.goto(url, timeout=60000)
-                    
-                    # Wait for README section with multiple fallbacks
-                    try:
-                        # Try GitHub's new README selector first
-                        readme_selector = "#readme .Box-body"
-                        page.wait_for_selector(readme_selector, state="visible", timeout=15000)
-                    except:
-                        # Fallback to older README selector
-                        try:
-                            readme_selector = "#readme"
-                            page.wait_for_selector(readme_selector, state="visible", timeout=10000)
-                        except:
-                            # Fallback to any markdown body
-                            page.wait_for_selector(".markdown-body", state="visible", timeout=10000)
-                            readme_selector = ".markdown-body"
-
-                    readme_element = page.locator(readme_selector)
-                    
-                    # Scroll to README section
-                    readme_element.scroll_into_view_if_needed()
-                    page.wait_for_timeout(2000)  # Allow scroll and rendering
-                    
-                    # Get bounding box with padding
-                    bbox = readme_element.bounding_box()
-                    if bbox:
-                        # Add padding to the screenshot
-                        padding = 20
-                        adjusted_bbox = {
-                            "x": max(0, bbox["x"] - padding),
-                            "y": max(0, bbox["y"] - padding),
-                            "width": bbox["width"] + (padding * 2),
-                            "height": bbox["height"] + (padding * 2)
-                        }
-                        
-                        filename = f"{url.split('/')[-1]}_{int(time.time())}.png"
-                        screenshot_path = screenshot_dir / filename
-                        
-                        page.screenshot(
-                            path=screenshot_path,
-                            clip=adjusted_bbox,
-                            type="png",
-                            animations="disabled"
-                        )
-                        return str(screenshot_path)
-                        
-                except Exception as e:
-                    print(f"Error capturing README: {e}")
-                    return None
-                finally:
-                    browser.close()
-                    
+            if os.path.exists(self.log_file):
+                with open(self.log_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        if "Posted: " in line:
+                            url = line.split("Posted: ")[1].strip()
+                            posted_urls.add(url)
         except Exception as e:
-            print(f"Screenshot failed for {url}: {e}")
-            return None
+            print(f"Error loading posted URLs: {e}")
+        return posted_urls
 
     def post_tweet(self, content: str, repo: Dict, screenshot_path: Optional[str] = None) -> bool:
-        """Post tweet with full error diagnostics"""
-        try:
-            # Validate tweet length
-            max_length = 280
-            full_content = f"{content}\n🔗 {repo['html_url']}"
-            if len(full_content) > max_length:
-                content = content[:max_length - len(full_content) + len(content) - 3] + "..."
+        """Güncellenmiş tweet gönderme mekanizması"""
+        max_retries = 5
+        base_delay = 15
+        media_ids = []
 
-            media_ids = []
-            if screenshot_path and os.path.exists(screenshot_path):
-                try:
-                    print(f"Attempting media upload: {screenshot_path}")
-                    media = self.twitter_client_v1.media_upload(
-                        filename=screenshot_path,
+        for attempt in range(max_retries):
+            try:
+                # 1. Medya yükleme
+                if screenshot_path and os.path.exists(screenshot_path):
+                    self._check_media_limits()
+                    media = self.media_client.media_upload(
+                        screenshot_path, 
                         media_category="tweet_image"
                     )
                     media_ids.append(media.media_id)
-                    print(f"Media uploaded successfully: {media.media_id}")
-                except tweepy.TweepyException as e:
-                    print(f"Media upload failed: {str(e)}")
-                    print(f"API Error Code: {e.api_code}")
-                    print(f"API Message: {e.api_messages}")
-                    return False
+                    self.rate_limit_tracker.update_from_headers(
+                        self.media_client.last_response.headers, 
+                        'media_upload'
+                    )
 
-            try:
-                tweet_params = {
-                    "text": content,
-                    "media_ids": media_ids or None
-                }
-                print(f"Posting tweet with params: {tweet_params}")
-                tweet = self.twitter_client_v2.create_tweet(**tweet_params)
-                
-                if tweet.errors:
-                    print(f"Twitter API Errors: {tweet.errors}")
-                    return False
-
-                print(f"Successfully posted tweet ID: {tweet.data['id']}")
+                # 2. Tweet oluşturma
+                self._check_tweet_limits()
+                tweet = self.twitter_client.create_tweet(
+                    text=content,
+                    media_ids=media_ids or None
+                )
+                self._log_success(repo, content, screenshot_path)
                 return True
 
-            except tweepy.TweepyException as e:
-                print(f"Twitter API Error: {str(e)}")
-                print(f"API Code: {e.api_code}")
-                print(f"API Messages: {e.api_messages}")
+            except tweepy.TooManyRequests as e:
+                endpoint = 'media_upload' if 'media/upload' in str(e) else 'tweet_create'
+                wait_time = self.rate_limit_tracker.get_wait_time(endpoint)
                 
-                if 403 in e.api_codes:
-                    print("\n🔴 Critical Permission Issue 🔴")
-                    print("1. REQUIRED: Apply for Elevated access at:")
-                    print("   https://developer.twitter.com/en/portal/products/elevated")
-                    print("2. In App permissions, enable:")
-                    print("   - Read & Write")
-                    print("   - Media upload")
-                    print("3. Regenerate ALL tokens after making changes")
-                    print("4. Update your .env file with new tokens")
-                
-                return False
+                print(f"Rate limit exceeded for {endpoint}. Waiting {wait_time} seconds")
+                time.sleep(wait_time + random.uniform(0, 5))
+                continue
 
-        except Exception as e:
-            print(f"Unexpected error: {str(e)}")
-            return False
-        finally:
-            if screenshot_path and os.path.exists(screenshot_path):
-                os.remove(screenshot_path)
+            except tweepy.TweepyException as e:
+                print(f"Twitter API error: {str(e)}")
+                if attempt < max_retries - 1:
+                    sleep_time = base_delay * (2 ** attempt) + random.uniform(0, 3)
+                    print(f"Retrying in {sleep_time} seconds...")
+                    time.sleep(sleep_time)
+                else:
+                    return False
+
+        return False
+
+    def _check_media_limits(self):
+        """Medya yükleme limitlerini kontrol et"""
+        media_limits = self.rate_limit_tracker.limits['media_upload']
+        if media_limits['remaining'] < 1:
+            wait_time = self.rate_limit_tracker.get_wait_time('media_upload')
+            print(f"Media upload limit reached. Waiting {wait_time} seconds")
+            time.sleep(wait_time)
+
+    def _check_tweet_limits(self):
+        """Tweet gönderme limitlerini kontrol et"""
+        tweet_limits = self.rate_limit_tracker.limits['tweet_create']
+        if tweet_limits['remaining'] < 1:
+            wait_time = self.rate_limit_tracker.get_wait_time('tweet_create')
+            print(f"Tweet creation limit reached. Waiting {wait_time} seconds")
+            time.sleep(wait_time)
 
     def _log_success(self, repo: Dict, content: str, screenshot_path: Optional[str]):
-        """Log successful post"""
+        """Güncellenmiş log mekanizması"""
         log_entry = (
-            f"\n[{time.ctime()}] Posted: {repo['html_url']}\n"
+            f"\n[{datetime.now().ctime()}] Posted: {repo['html_url']}\n"
             f"Content: {content}\n"
-            f"Screenshot: {screenshot_path or 'None'}\n"
+            f"Media: {screenshot_path or 'None'}\n"
+            f"Rate Limits: {self.rate_limit_tracker.limits}\n"
             f"{'-'*50}"
         )
         with open(self.log_file, "a", encoding="utf-8") as f:
             f.write(log_entry)
-        self.posted_urls.add(repo['html_url'])
 
     def run(self):
-        """Main execution loop"""
+        """Main execution loop with enhanced error handling"""
         print("Starting RepoTweetBot...")
         while True:
             try:
                 projects = self.fetch_github_projects()
                 if not projects:
-                    print("No projects fetched, retrying in 5 minutes...")
-                    time.sleep(300)
+                    print("No projects found, retrying in 1 hour...")
+                    time.sleep(3600)
                     continue
 
                 new_projects = [p for p in projects if p['html_url'] not in self.posted_urls]
                 if not new_projects:
-                    print("No new projects found, refreshing in 1 hour...")
-                    time.sleep(3600)
+                    print("No new projects, refreshing in 2 hours...")
+                    time.sleep(7200)
                     continue
 
                 repo = random.choice(new_projects)
                 print(f"Selected repository: {repo['html_url']}")
 
-                # Generate content and try to get screenshot
+                # Generate content and screenshot
                 tweet_content = self.generate_tweet_content(repo)
-                try:
-                    screenshot_path = self.take_screenshot(repo['html_url'])
-                except Exception as e:
-                    print(f"Screenshot failed, continuing without image: {e}")
-                    screenshot_path = None
+                screenshot_path = self.take_screenshot(repo['html_url'])
 
                 if self.post_tweet(tweet_content, repo, screenshot_path):
-                    print(f"Successfully posted: {repo['html_url']}")
+                    print("Tweet posted successfully!")
                     time.sleep(self.sleep_interval)
                 else:
-                    print("Posting failed, retrying in 10 minutes...")
-                    time.sleep(600)
+                    print("Posting failed, retrying in 30 minutes...")
+                    time.sleep(1800)
 
+            except KeyboardInterrupt:
+                print("\nShutting down gracefully...")
+                break
             except Exception as e:
                 print(f"Critical error: {e}")
                 time.sleep(600)
 
 def main():
-    """Entry point with configuration setup"""
     load_dotenv()
     
     config = Config(
