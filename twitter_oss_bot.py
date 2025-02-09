@@ -281,7 +281,13 @@ Guidelines:
         return posted_urls
 
     def post_tweet(self, content: str, repo: Dict, screenshot_path: Optional[str] = None) -> bool:
-        """Güncellenmiş tweet gönderme mekanizması"""
+        """Post tweet with URL tracking"""
+        # Check if already posted
+        repo_url = repo['html_url']
+        if repo_url in self.posted_urls:
+            print(f"Already posted about {repo_url}, skipping...")
+            return False
+
         max_retries = 5
         base_delay = 15
         media_ids = []
@@ -312,12 +318,14 @@ Guidelines:
 
                 # 3. Add repository link as reply
                 if main_tweet_id:
-                    reply_text = f"🔗 {repo['html_url']}"
+                    reply_text = f"🔗 {repo_url}"
                     self.twitter_client.create_tweet(
                         text=reply_text,
                         in_reply_to_tweet_id=main_tweet_id
                     )
 
+                # Update posted URLs set
+                self.posted_urls.add(repo_url)
                 self._log_success(repo, content, screenshot_path, main_tweet_id)
                 return True
 
