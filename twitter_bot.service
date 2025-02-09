@@ -1,0 +1,15 @@
+[Unit]
+Description=Twitter OSS Bot Service
+After=network.target
+
+[Service]
+Type=simple
+User=your_username
+WorkingDirectory=/path/to/your/bot/directory
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /path/to/your/bot/directory/twitter_oss_bot.py
+Restart=always
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target 

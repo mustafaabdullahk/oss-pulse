@@ -10,6 +10,7 @@ from typing import List, Dict, Optional
 from dataclasses import dataclass
 from playwright.sync_api import sync_playwright
 from pathlib import Path
+import langdetect
 
 @dataclass
 class Config:
@@ -152,26 +153,36 @@ class RepoTweetBot:
             raise
 
     def generate_tweet_content(self, repo: Dict) -> str:
-        """Generate tweet content using Ollama deepseek-coder"""
+        """Generate tweet content using Ollama deepseek-coder with language check"""
         name = repo.get('name', 'Unnamed Project')
         description = repo.get('description', 'No description available.')
+        
+        # Skip if description is not in English
+        try:
+            if description and langdetect.detect(description) != 'en':
+                print(f"Skipping non-English repository: {name}")
+                return ""
+        except:
+            # If language detection fails, continue with content generation
+            pass
+
         stars = repo.get('stargazers_count', 0)
         language = repo.get('language', 'Unknown')
-        repo_url = repo.get('html_url', '')
 
         prompt = f"""Create an engaging technical tweet about this open-source project:
 - Project: {name}
 - Language: {language}
 - Stars: {stars}
 - Description: {description}
-- URL: {repo_url}
 
 Guidelines:
 - Keep under 250 characters
+- DO NOT include URLs or links
 - Highlight technical merits
 - Include relevant hashtags (max 3)
 - Emphasize why developers should check it out
-- Use emojis sparingly"""
+- Use emojis sparingly
+- Response MUST be in English"""
 
         try:
             response = ollama.generate(
@@ -180,7 +191,18 @@ Guidelines:
                 options={'max_tokens': 280, 'temperature': 0.7}
             )
             content = response['response'].strip()
-            return self._sanitize_tweet(content)
+            
+            # Verify generated content is in English
+            try:
+                if langdetect.detect(content) != 'en':
+                    print(f"Generated non-English content for {name}, retrying...")
+                    return self._generate_fallback_content(repo)
+            except:
+                pass
+                
+            content = self._sanitize_tweet(content)
+            content = content.replace(repo.get('html_url', ''), '').strip()
+            return content
         except Exception as e:
             print(f"LLM generation failed: {e}")
             return self._generate_fallback_content(repo)
