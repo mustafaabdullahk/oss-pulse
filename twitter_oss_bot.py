@@ -157,13 +157,14 @@ class RepoTweetBot:
         name = repo.get('name', 'Unnamed Project')
         description = repo.get('description', 'No description available.')
         
-        # Skip if description is not in English
+        # Only check description for non-English content
         try:
-            if description and langdetect.detect(description) != 'en':
-                print(f"Skipping non-English repository: {name}")
+            if description and description.strip() and langdetect.detect(description) != 'en':
+                print(f"Skipping non-English repository description: {name}")
                 return ""
-        except:
-            # If language detection fails, continue with content generation
+                
+        except langdetect.LangDetectException:
+            print(f"Language detection failed for: {name}")
             pass
 
         stars = repo.get('stargazers_count', 0)
@@ -182,7 +183,9 @@ Guidelines:
 - Include relevant hashtags (max 3)
 - Emphasize why developers should check it out
 - Use emojis sparingly
-- Response MUST be in English"""
+- Response MUST be in English
+- DO NOT include any thinking process or explanations
+- ONLY output the final tweet text"""
 
         try:
             response = ollama.generate(
@@ -192,16 +195,17 @@ Guidelines:
             )
             content = response['response'].strip()
             
-            # Verify generated content is in English
-            try:
-                if langdetect.detect(content) != 'en':
-                    print(f"Generated non-English content for {name}, retrying...")
-                    return self._generate_fallback_content(repo)
-            except:
-                pass
-                
+            # Remove any <think> blocks
+            if "<think>" in content:
+                content = content.split("</think>")[-1].strip()
+            
+            # Clean up the content
             content = self._sanitize_tweet(content)
             content = content.replace(repo.get('html_url', ''), '').strip()
+            
+            # Remove quotes if present
+            content = content.strip('"').strip()
+            
             return content
         except Exception as e:
             print(f"LLM generation failed: {e}")
@@ -419,8 +423,12 @@ Guidelines:
                 repo = random.choice(new_projects)
                 print(f"Selected repository: {repo['html_url']}")
 
-                # Generate content and screenshot
+                # Generate content and check if it's valid
                 tweet_content = self.generate_tweet_content(repo)
+                if not tweet_content:  # Skip if content is empty
+                    print(f"Skipping repository due to language: {repo['html_url']}")
+                    continue
+
                 screenshot_path = self.take_screenshot(repo['html_url'])
 
                 if self.post_tweet(tweet_content, repo, screenshot_path):
