@@ -82,6 +82,15 @@ class RepoTweetBot:
             wait_on_rate_limit=True
         )
 
+    def _random_user_agent(self) -> str:
+        """Generate random user agent"""
+        agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+        ]
+        return random.choice(agents)
+
     def _init_media_api(self) -> tweepy.API:
         """Initialize v1.1 API for media uploads"""
         auth = tweepy.OAuth1UserHandler(
@@ -91,7 +100,7 @@ class RepoTweetBot:
             access_token_secret=self.config.twitter_access_token_secret
         )
         return tweepy.API(auth)
-    
+
     def fetch_github_projects(self) -> List[Dict]:
         """Scrape trending repositories from GitHub's trending page"""
         try:
@@ -212,7 +221,7 @@ Guidelines:
             return self._generate_fallback_content(repo)
         
     def take_screenshot(self, url: str) -> Optional[str]:
-        """Capture square README section screenshot with validation"""
+        """Capture centered README section screenshot"""
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
@@ -244,17 +253,44 @@ Guidelines:
                     if not bbox or bbox['width'] == 0 or bbox['height'] == 0:
                         return None
 
-                    # Ensure capture area stays within page bounds
+                    # Calculate centered capture area
                     square_size = 900
                     page_width = page.evaluate("document.documentElement.scrollWidth")
                     page_height = page.evaluate("document.documentElement.scrollHeight")
-                    
+
+                    # Horizontal centering
+                    readme_center_x = bbox["x"] + bbox["width"]/2
+                    capture_x = max(0, min(
+                        readme_center_x - square_size/2,
+                        page_width - square_size
+                    ))
+
+                    # Vertical centering (focus on first 1200px)
+                    capture_y = max(0, min(
+                        bbox["y"] + 200,  # Start 200px below top of README
+                        page_height - square_size
+                    ))
+
                     safe_area = {
-                        "x": max(0, min(bbox["x"], page_width - square_size)),
-                        "y": max(0, min(bbox["y"], page_height - square_size)),
-                        "width": min(square_size, page_width),
-                        "height": min(square_size, page_height)
+                        "x": capture_x,
+                        "y": capture_y,
+                        "width": square_size,
+                        "height": square_size
                     }
+
+                    # Add visual feedback for debugging
+                    page.evaluate(f"""() => {{
+                        const div = document.createElement('div');
+                        div.style.position = 'absolute';
+                        div.style.left = '{safe_area['x']}px';
+                        div.style.top = '{safe_area['y']}px';
+                        div.style.width = '{safe_area['width']}px';
+                        div.style.height = '{safe_area['height']}px';
+                        div.style.border = '3px solid #ff0000';
+                        div.style.zIndex = '9999';
+                        document.body.appendChild(div);
+                    }}""")
+                    page.wait_for_timeout(500)  # Let red box appear
 
                     # Take screenshot
                     filename = f"{url.split('/')[-1]}_{int(time.time())}.png"
@@ -307,20 +343,18 @@ Guidelines:
         return posted_urls
 
     def post_tweet(self, content: str, repo: Dict, screenshot_path: Optional[str] = None) -> bool:
-        """Post tweet with URL tracking"""
-        # Check if already posted
-        repo_url = repo['html_url']
-        if repo_url in self.posted_urls:
-            print(f"Already posted about {repo_url}, skipping...")
-            return False
-
-        max_retries = 5
-        base_delay = 15
-        media_ids = []
-        main_tweet_id = None
-
+        """Post tweet with enhanced rate limit handling"""
+        max_retries = 3
+        base_delay = 60
+        
         for attempt in range(max_retries):
             try:
+                # Check if already posted
+                repo_url = repo['html_url']
+                if repo_url in self.posted_urls:
+                    print(f"Already posted about {repo_url}, skipping...")
+                    return False
+
                 # 1. Medya yükleme
                 if screenshot_path and os.path.exists(screenshot_path):
                     self._check_media_limits()
@@ -328,7 +362,6 @@ Guidelines:
                         screenshot_path, 
                         media_category="tweet_image"
                     )
-                    media_ids.append(media.media_id)
                     self.rate_limit_tracker.update_from_headers(
                         self.media_client.last_response.headers, 
                         'media_upload'
@@ -338,36 +371,59 @@ Guidelines:
                 self._check_tweet_limits()
                 tweet = self.twitter_client.create_tweet(
                     text=content,
-                    media_ids=media_ids or None
+                    media_ids=[media.media_id] if media else None
                 )
-                main_tweet_id = tweet.data['id']
 
                 # 3. Add repository link as reply
-                if main_tweet_id:
+                if tweet.data['id']:
                     reply_text = f"🔗 {repo_url}"
                     self.twitter_client.create_tweet(
                         text=reply_text,
-                        in_reply_to_tweet_id=main_tweet_id
+                        in_reply_to_tweet_id=tweet.data['id']
                     )
 
                 # Update posted URLs set
                 self.posted_urls.add(repo_url)
-                self._log_success(repo, content, screenshot_path, main_tweet_id)
+                self._log_success(repo, content, screenshot_path, tweet.data['id'])
+
+                # Add random human-like variations
+                # Randomize tweet length
+                if len(content) > 200 and random.random() < 0.3:
+                    content = content[:197] + "..."
+
+                # Randomize hashtag order
+                hashtags = [word for word in content.split() if word.startswith("#")]
+                if len(hashtags) > 1 and random.random() < 0.5:
+                    random.shuffle(hashtags)
+                    content = ' '.join([word for word in content.split() if not word.startswith("#")] + hashtags)
+
+                # Random delay between actions
+                time.sleep(random.uniform(2.5, 8.2))
+
                 return True
 
             except tweepy.TooManyRequests as e:
-                endpoint = 'media_upload' if 'media/upload' in str(e) else 'tweet_create'
-                wait_time = self.rate_limit_tracker.get_wait_time(endpoint)
+                # Parse rate limit headers
+                headers = e.response.headers
+                limit = int(headers.get('x-rate-limit-limit', 50))
+                remaining = int(headers.get('x-rate-limit-remaining', 0))
+                reset_time = int(headers.get('x-rate-limit-reset', time.time() + 900))
                 
-                print(f"Rate limit exceeded for {endpoint}. Waiting {wait_time} seconds")
-                time.sleep(wait_time + random.uniform(0, 5))
+                # Calculate wait time with jitter
+                wait_time = max(reset_time - time.time(), 300) + random.randint(0, 120)
+                
+                print(f"Rate limit: {remaining}/{limit} remaining")
+                print(f"Next window resets at: {time.ctime(reset_time)}")
+                print(f"Waiting {wait_time//60} minutes {wait_time%60} seconds")
+                
+                time.sleep(wait_time)
                 continue
 
             except tweepy.TweepyException as e:
-                print(f"Twitter API error: {str(e)}")
                 if attempt < max_retries - 1:
-                    sleep_time = base_delay * (2 ** attempt) + random.uniform(0, 3)
-                    print(f"Retrying in {sleep_time} seconds...")
+                    # Exponential backoff with jitter
+                    sleep_time = (base_delay * (2 ** attempt)) + random.uniform(0, 15)
+                    print(f"Retrying in {sleep_time:.1f} seconds...")
                     time.sleep(sleep_time)
                 else:
                     return False
@@ -404,7 +460,7 @@ Guidelines:
             f.write(log_entry)
 
     def run(self):
-        """Main execution loop with enhanced error handling"""
+        """Main execution loop with randomized intervals"""
         print("Starting RepoTweetBot...")
         while True:
             try:
@@ -433,17 +489,21 @@ Guidelines:
 
                 if self.post_tweet(tweet_content, repo, screenshot_path):
                     print("Tweet posted successfully!")
-                    time.sleep(self.sleep_interval)
+                    # Random delay between 45-75 minutes
+                    delay = random.randint(2700, 4500)  # 45-75 minutes
+                    time.sleep(delay)
                 else:
-                    print("Posting failed, retrying in 30 minutes...")
-                    time.sleep(1800)
+                    # Shorter delay for failures
+                    delay = random.randint(600, 1800)  # 10-30 minutes
+                    print(f"Posting failed, retrying in {delay//60} minutes...")
+                    time.sleep(delay)
 
             except KeyboardInterrupt:
                 print("\nShutting down gracefully...")
                 break
             except Exception as e:
                 print(f"Critical error: {e}")
-                time.sleep(600)
+                time.sleep(random.randint(300, 900))
 
 def main():
     load_dotenv()
