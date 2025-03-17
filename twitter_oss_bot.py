@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from playwright.sync_api import sync_playwright
 from pathlib import Path
 import langdetect
+import re
 
 @dataclass
 class Config:
@@ -179,22 +180,21 @@ class RepoTweetBot:
         stars = repo.get('stargazers_count', 0)
         language = repo.get('language', 'Unknown')
 
-        prompt = f"""Create an engaging technical tweet about this open-source project:
+        prompt = f"""Create ONE SHORT SENTENCE about this project:
 - Project: {name}
 - Language: {language}
 - Stars: {stars}
 - Description: {description}
 
-Guidelines:
-- Keep under 250 characters
-- DO NOT include URLs or links
-- Highlight technical merits
-- Include relevant hashtags (max 3)
-- Emphasize why developers should check it out
-- Use emojis sparingly
-- Response MUST be in English
-- DO NOT include any thinking process or explanations
-- ONLY output the final tweet text"""
+RULES:
+- 1 sentence only (15-25 words)
+- Natural, conversational tone
+- Focus on key technical merit
+- Max 3 hashtags
+- No URLs/markdown/formatting
+- ENGLISH ONLY
+- NO EXPLANATIONS/THINKING
+- OUTPUT ONLY THE FINAL TWEET"""
 
         try:
             response = ollama.generate(
@@ -317,8 +317,26 @@ Guidelines:
 
 
     def _sanitize_tweet(self, text: str) -> str:
-        """Clean up generated tweet text"""
-        return text.split("```")[0].replace("**", "").strip()
+        """Clean up generated tweet text with enhanced filtering"""
+        # Remove thinking process blocks
+        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+        
+        # Remove code blocks and markdown
+        text = text.split("```")[0].replace("**", "").strip()
+        
+        # Remove any leftover explanation phrases
+        explanation_phrases = [
+            "Here's a tweet:", "Tweet:", "Suggested post:", 
+            "Engaging tweet:", "Social media post:"
+        ]
+        for phrase in explanation_phrases:
+            text = text.replace(phrase, '')
+            
+        # Trim to first sentence if too long
+        if len(text) > 280:
+            text = text[:280].rsplit('.', 1)[0] + '.'
+            
+        return text.strip()
 
     def _generate_fallback_content(self, repo: Dict) -> str:
         """Fallback content generation"""
@@ -460,10 +478,23 @@ Guidelines:
             f.write(log_entry)
 
     def run(self):
-        """Main execution loop with randomized intervals"""
+        """Main execution loop with randomized intervals and hours"""
         print("Starting RepoTweetBot...")
         while True:
             try:
+                # Get current hour
+                current_hour = datetime.now().hour
+                
+                # Define active hours (e.g., 9 AM to 11 PM)
+                active_hours = list(range(9, 23))  # 9 AM to 11 PM
+                
+                # Skip non-active hours with 80% probability
+                if current_hour not in active_hours and random.random() < 0.8:
+                    sleep_time = random.randint(1800, 3600)  # 30-60 minutes
+                    print(f"Outside active hours ({current_hour}:00), sleeping for {sleep_time//60} minutes...")
+                    time.sleep(sleep_time)
+                    continue
+
                 projects = self.fetch_github_projects()
                 if not projects:
                     print("No projects found, retrying in 1 hour...")
@@ -476,12 +507,18 @@ Guidelines:
                     time.sleep(7200)
                     continue
 
+                # Random chance to skip posting (10%)
+                if random.random() < 0.1:
+                    skip_time = random.randint(1800, 5400)  # 30-90 minutes
+                    print(f"Randomly skipping post, waiting {skip_time//60} minutes...")
+                    time.sleep(skip_time)
+                    continue
+
                 repo = random.choice(new_projects)
                 print(f"Selected repository: {repo['html_url']}")
 
-                # Generate content and check if it's valid
                 tweet_content = self.generate_tweet_content(repo)
-                if not tweet_content:  # Skip if content is empty
+                if not tweet_content:
                     print(f"Skipping repository due to language: {repo['html_url']}")
                     continue
 
@@ -489,11 +526,11 @@ Guidelines:
 
                 if self.post_tweet(tweet_content, repo, screenshot_path):
                     print("Tweet posted successfully!")
-                    # Random delay between 45-75 minutes
-                    delay = random.randint(2700, 4500)  # 45-75 minutes
+                    # Random delay between 45-120 minutes with more variation
+                    delay = random.randint(2700, 7200)  # 45-120 minutes
+                    print(f"Next post scheduled in {delay//60} minutes...")
                     time.sleep(delay)
                 else:
-                    # Shorter delay for failures
                     delay = random.randint(600, 1800)  # 10-30 minutes
                     print(f"Posting failed, retrying in {delay//60} minutes...")
                     time.sleep(delay)
